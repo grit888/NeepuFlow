@@ -1,0 +1,23 @@
+# ---- 隐私：绝对不能提交 ----
+config.json
+neepu_flow.log
+dump/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 打包产物 ----
+*.zip
+*.7z
