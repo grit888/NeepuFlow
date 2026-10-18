@@ -39,6 +39,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 LOG_PATH = os.path.join(BASE_DIR, "neepu_flow.log")
 DUMP_DIR = os.path.join(BASE_DIR, "dump")
+PID_PATH = os.path.join(BASE_DIR, "daemon.pid")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -691,14 +692,80 @@ def panabit_encode(pw):
     return aes_ecb_hex((salt + pw).encode("utf-8"), PANABIT_KEY)
 
 
+def _ipconfig_sections():
+    """按适配器切分 ipconfig 输出，返回 [(适配器名, [ip...], [网关...]), ...]"""
+    try:
+        out = subprocess.run(
+            ["ipconfig"], capture_output=True, text=True,
+            encoding="gbk", errors="replace", timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout or ""
+    except Exception:
+        return []
+    sections, cur = [], None
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        # 适配器标题行：不缩进、以冒号结尾
+        if line[:1] not in (" ", "\t") and line.rstrip().endswith(":"):
+            cur = {"name": line.rstrip()[:-1].strip(), "ips": [], "gws": []}
+            sections.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.search(r"IPv4[^:：]*[:：]\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", line)
+        if m:
+            cur["ips"].append(m.group(1))
+            continue
+        m = re.search(r"(?:默认网关|Default Gateway)[^:：]*[:：]\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", line)
+        if m:
+            cur["gws"].append(m.group(1))
+    return [(s["name"], s["ips"], s["gws"]) for s in sections if s["ips"]]
+
+
+def _can_reach_portal_from(ip, host=PANABIT_HOST, port=80, timeout=1.5):
+    """从指定本机地址出发，能不能连上认证网关"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.bind((ip, 0))
+        return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
 def local_ip():
-    """本机在校园网里的地址（不发包，只让系统选路由）"""
+    """本机在校园网里的地址。
+
+    不能只问"系统会从哪张网卡出去"—— 装了 VPN（TUN 虚拟网卡）之后，
+    到网关的路由会被 VPN 抢走，拿回来就是 172.29.x.x 这种虚拟地址，
+    拿去认证门户只会回"无效的帐号"。所以先按网卡挑，再用实际连通性验证。
+    """
+    cands = []
+    for name, ips, gws in _ipconfig_sections():
+        nice = 2 if ("WLAN" in name.upper() or "无线" in name) else 0
+        has_gw = 1 if gws else 0
+        for ip in ips:
+            if ip.startswith("127."):
+                continue
+            cands.append((nice + has_gw, ip))
+    cands.sort(key=lambda x: -x[0])
+
+    tried = []
+    for _, ip in cands:
+        tried.append(ip)
+        if _can_reach_portal_from(ip):
+            return ip
+
+    # 全都连不上就退回"系统选哪张网卡"
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        s.connect(("202.198.8.232", 80))
-        return s.getsockname()[0]
+        s.connect((PANABIT_HOST, 80))
+        ip = s.getsockname()[0]
+        return ip
     except Exception:
-        return ""
+        return tried[0] if tried else ""
     finally:
         s.close()
 
@@ -1256,6 +1323,70 @@ def single_instance_lock():
         return None
 
 
+# ---------------------------------------------------------------- 后台进程的 pid 记录
+# 光有文件锁，界面上就只知道"有人在跑"，没法告诉用户是谁、更没法接管。
+# 所以拿到锁的一方把 pid 写进 daemon.pid，界面靠它实现「结束后台并接管」。
+
+def write_pid():
+    try:
+        with open(PID_PATH, "w", encoding="ascii") as f:
+            f.write(str(os.getpid()))
+    except Exception:
+        pass
+
+
+def read_pid():
+    try:
+        with open(PID_PATH, "r", encoding="ascii") as f:
+            return int((f.read() or "").strip() or 0)
+    except Exception:
+        return 0
+
+
+def clear_pid(only_if=0):
+    """删 pid 文件；only_if 非 0 时只有内容匹配才删，避免误删别人的"""
+    try:
+        if only_if and read_pid() != only_if:
+            return
+        if os.path.exists(PID_PATH):
+            os.remove(PID_PATH)
+    except Exception:
+        pass
+
+
+def pid_alive(pid):
+    """进程还在、而且确实是 python（防止 pid 被系统复用后误判）"""
+    if not pid or pid <= 0:
+        return False
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout or ""
+        return "python" in out.lower()
+    except Exception:
+        return False
+
+
+def kill_bg(pid=None):
+    """结束后台进程，返回 (成功?, 说明)"""
+    pid = pid or read_pid()
+    if not pid_alive(pid):
+        return False, "没找到正在运行的后台（pid=%s）" % (pid or "无")
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True, text=True, timeout=8,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        return False, "结束失败：%s: %s" % (type(e).__name__, e)
+    for _ in range(10):
+        if not pid_alive(pid):
+            clear_pid(pid)
+            return True, "已结束后台 pid=%d" % pid
+        time.sleep(0.3)
+    return False, "结束失败（pid=%d 还在，可能权限不足）" % pid
+
+
 # ---------------------------------------------------------------- 开机自启（启动文件夹）
 
 def startup_dir():
@@ -1481,6 +1612,7 @@ def cmd_daemon():
     if lock is None:
         LOG("已有实例在运行，退出")
         return
+    write_pid()
     cfg = Config().load()
     LOG("=" * 50)
     LOG("NeepuFlow 后台启动 pid=%s" % os.getpid())
@@ -1491,6 +1623,8 @@ def cmd_daemon():
             w.join(5)
     except KeyboardInterrupt:
         w.stop()
+    finally:
+        clear_pid(only_if=os.getpid())
 
 
 # ---------------------------------------------------------------- GUI
@@ -1671,17 +1805,48 @@ def run_gui():
         else:
             status_var.set("保存失败")
 
-    def start_worker():
+    def start_worker(interactive=True):
         if worker_holder["w"] and worker_holder["w"].is_alive():
             worker_holder["w"].stop()
         if worker_holder["lock"] is None:
             lock = single_instance_lock()
             if lock is None:
-                # 开机自启的那个 --daemon 已经在跑了，别再起一个重复认证
-                LOG("已有 NeepuFlow 后台在运行（多半是开机自启那个），本次不另起")
-                status_var.set("后台已在运行（开机自启那个）")
-                return
+                # 已经有别的 NeepuFlow 在跑（开机自启那个 --daemon）。
+                # 以前这里只改一行状态栏，用户点了"保存并启用"却什么都没发生，
+                # 看着就像坏了。现在问一句，可以直接接管。
+                pid = read_pid()
+                if pid_alive(pid):
+                    if not interactive:
+                        status_var.set("后台已在运行（pid=%d），界面接管需要手动确认" % pid)
+                        return
+                    tip = "已经有一个 NeepuFlow 后台在跑（多半是开机自启那个，pid=%d）。\n\n" \
+                          "要结束它，改由当前界面接管吗？\n\n" \
+                          "· 是 → 结束旧后台，用你现在的设置重新开始\n" \
+                          "· 否 → 保留旧后台；你改的设置已保存，下次启动才生效" % pid
+                    if not messagebox.askyesno("后台已在运行", tip):
+                        status_var.set("保留原后台（设置已保存，下次生效）")
+                        return
+                    ok, why = kill_bg(pid)
+                    LOG(why)
+                    if not ok:
+                        status_var.set(why)
+                        messagebox.showwarning("接管失败", why)
+                        return
+                    time.sleep(0.5)
+                    lock = single_instance_lock()
+                if lock is None:
+                    LOG("已有 NeepuFlow 后台在运行，本次不另起")
+                    status_var.set("后台已在运行（找不到它的 pid，可能是旧版本启动的）")
+                    if interactive:
+                        messagebox.showinfo(
+                            "后台已在运行",
+                            "已经有一个 NeepuFlow 后台在跑，但它是旧版本启动的、没留下 pid，"
+                            "界面没法替你结束它。\n\n"
+                            "处理办法：重启一次电脑，或在任务管理器里结束 pythonw.exe。\n"
+                            "（新版以后再遇到就不会这样了）")
+                    return
             worker_holder["lock"] = lock
+            write_pid()
         w = Worker(cfg)
         worker_holder["w"] = w
         w.start()
@@ -1691,7 +1856,14 @@ def run_gui():
         cfg.save()
         if worker_holder["w"]:
             worker_holder["w"].stop()
-        status_var.set("后台已停止")
+        # 停的可能是"开机自启那个"后台，而不是界面自己的线程
+        pid = read_pid()
+        if pid and pid != os.getpid() and pid_alive(pid):
+            ok, why = kill_bg(pid)
+            LOG(why)
+            status_var.set(why if ok else ("界面线程已停，但后台没停掉：" + why))
+        else:
+            status_var.set("后台已停止")
 
     bf = ttk.Frame(p1)
     bf.grid(row=5, column=1, sticky="w", pady=(6, 0))
@@ -1811,8 +1983,53 @@ def run_gui():
     root.after(600, fill_log)
 
     if cfg["enabled"] and cfg["username"]:
-        start_worker()
+        start_worker(interactive=False)
         status_var.set("后台已启动")
+
+    def on_close():
+        """关窗口不再等于"关掉自动登录"—— 否则断网后就没人管了"""
+        w = worker_holder.get("w")
+        if w and w.is_alive():
+            ans = messagebox.askyesnocancel(
+                "退出 NeepuFlow",
+                "自动登录正在后台运行。\n\n"
+                "· 是 → 关掉界面，后台继续跑（断网后照样自动连）\n"
+                "· 否 → 连后台一起停掉，断网后就不会自动连了\n"
+                "· 取消 → 什么都不做，继续留在界面里",
+                icon="question")
+            if ans is None:
+                return
+            if ans:
+                try:
+                    if worker_holder.get("lock") is not None:
+                        w.stop()
+                        time.sleep(0.3)
+                        try:
+                            worker_holder["lock"].close()
+                        except Exception:
+                            pass
+                        worker_holder["lock"] = None
+                    flags = 0
+                    for name in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+                        flags |= getattr(subprocess, name, 0)
+                    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--daemon"],
+                                     cwd=BASE_DIR, close_fds=True,
+                                     creationflags=flags,
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                    LOG("界面退出，已转后台 --daemon 继续")
+                except Exception as e:
+                    LOG("转后台失败：%s: %s" % (type(e).__name__, e))
+                    messagebox.showerror(
+                        "NeepuFlow",
+                        "转后台失败了：%s\n\n"
+                        "界面先不关，你可以直接点「保存并启用」重开后台。" % e)
+                    return
+        clear_pid(only_if=os.getpid())
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     if GUI_AUTOCLOSE:
         root.after(2500, root.destroy)
